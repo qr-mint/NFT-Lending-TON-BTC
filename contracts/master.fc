@@ -1,0 +1,461 @@
+#pragma version >=0.2.0;
+#include "imports/stdlib.fc";
+#include "imports/math.fc";
+#include "imports/op-codes.fc";
+#include "imports/errors.fc";
+#include "imports/constants.fc";
+#include "src/ton.fc";
+#include "src/storage.fc";
+#include "src/master-storage.fc";
+#include "src/asset-config-packer.fc";
+#include "src/asset-dynamics-packer.fc";
+#include "src/utils.fc";
+#include "src/master-utils.fc";
+#include "src/master-get-methods.fc";
+#include "src/supply-message.fc";
+#include "src/withdraw-message.fc";
+#include "src/asset.fc";
+
+;; TODO: refactor repetition with user-storage::save
+cell calculate_user_init_data(slice owner_address) {
+  return begin_cell()
+    .store_slice(my_address())
+    .store_slice(owner_address)
+    .store_dict(new_dict())
+    .store_bool(false)
+    .end_cell();
+}
+
+cell calculate_user_state_init(cell code, slice owner_address) {
+  return pack_state_init(code, calculate_user_init_data(owner_address));
+}
+
+slice calculate_user_address(cell code, slice owner_address) {
+  return calculate_address(calculate_user_state_init(code, owner_address));
+}
+
+
+;; ??? Do we need send-mode as a separate parameter?
+() send_message_to_lending_wallet(cell code, slice owner_address, cell content) impure {
+  cell state_init = calculate_user_state_init(code, owner_address);
+  slice lending_wallet_address = calculate_address(state_init);
+ 
+  var msg = begin_cell()
+            .store_uint(0x10, 6) ;; Non-bounceable to be able to deploy
+            .store_slice(lending_wallet_address)
+            .store_grams(250000000) ;; ??? how much? 0.25 TON for now
+            .store_uint(4 + 2 + 1, 1 + 4 + 4 + 64 + 32 + 1 + 1 + 1)
+            .store_ref(state_init)
+            .store_ref(content);
+
+  send_raw_message(msg.end_cell(), 1); ;; pay transfer fees separately, revert on errors
+}
+
+() init_user (cell code, slice owner_address) impure {
+  send_message_to_lending_wallet(code, owner_address, begin_cell().end_cell()); ;; TODO set dict with key:assetaddress and zero values
+}
+
+;; --------------- Supply ---------------
+
+cell process_incoming_asset(
+  cell code,
+  cell asset_config_collection, cell asset_dynamics_collection,
+  int asset_master_hash, slice owner_address, int amount 
+) impure {
+~dump(99);
+  (int price, _, _,
+	int total_supply_principal, int total_borrow_principal,
+	int last_accural, int token_balance) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_master_hash);
+~dump(992);
+  (int s_rate, int b_rate) = get_current_rates(
+    asset_config_collection, asset_dynamics_collection,
+    calc_address_from_hash(asset_master_hash), ;; TODO@sepezho: this assembles address from hash only to parse it in the first line of the function
+    now() - last_accural 
+  );
+
+~dump(21);
+  ~dump(s_rate);
+  ~dump(b_rate);
+  send_message_to_lending_wallet(
+    code, owner_address,
+    pack_supply_message(
+      1234, ;; query_id ??? What to set it to?
+      asset_master_hash, amount,
+      s_rate, b_rate
+    )
+  );
+
+~dump(13);
+  asset_dynamics_collection~asset_dynamics_collection:set_packed(
+    asset_master_hash,
+    price,
+    s_rate, b_rate, ;; These are NEW (not unpacked) computed values
+    total_supply_principal, total_borrow_principal,
+    now(), ;; last_accural updated because s_rate and b_rate are new
+    token_balance + amount ;; got money
+  );
+
+~dump(1444);
+  return asset_dynamics_collection;
+}
+
+cell process_incoming_ton(
+  cell code,
+  cell asset_config_collection, cell asset_dynamics_collection,
+  slice owner_address, int amount
+) {
+~dump(constants::ton_asset_id);
+  return process_incoming_asset(
+    code,
+    asset_config_collection, asset_dynamics_collection,
+    constants::ton_asset_id, owner_address, amount
+  );
+  ;; ??? Do we need to withhold some amount of TONs for network fees, etc.?
+}
+
+;; --------------- Withdraw ---------------
+
+cell process_withdraw_master(
+  cell code,
+  cell asset_config_collection, cell asset_dynamics_collection,
+  slice owner_address, int asset_id, int amount, int query_id
+) {
+  (int price, _, _,
+	 int total_supply_principal, int total_borrow_principal,
+	 int last_accural, int token_balance)
+   = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+
+  (int s_rate, int b_rate) = get_current_rates(
+    asset_config_collection, asset_dynamics_collection,
+    calc_address_from_hash(asset_id), ;; TODO@sepezho: this assembles address from hash only to parse it in the first line of the function
+    now() - last_accural 
+  );
+  
+  send_message_to_lending_wallet(
+    code, owner_address,
+    pack_withdraw_user_message(
+      query_id,
+      asset_id, amount,
+      s_rate, b_rate,
+      asset_config_collection, asset_dynamics_collection
+    )
+  );
+
+  asset_dynamics_collection~asset_dynamics_collection:set_packed(
+    asset_id,
+    price,
+    s_rate, b_rate, ;; These are NEW (not unpacked) computed values
+    total_supply_principal, total_borrow_principal,
+    now(), ;; last_accural updated because s_rate and b_rate are new
+    token_balance ;; this doesn't change, because withdraw is not yet confirmed
+  );
+
+  return asset_dynamics_collection;
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  slice sender_address = cs~load_msg_addr();
+  var (wc, addr_hash) = parse_std_addr(sender_address);
+  var (wc_master, _) = parse_std_addr(my_address());
+  
+  throw_unless(error::master_different_workchain, wc == wc_master);
+
+  if (flags & 1) { ;; note: do we need it?
+		throw(0xffff); 
+  }
+
+  (cell meta, cell user_contract_code, cell asset_config_collection, int if_active, slice admin, cell wallet_to_master, cell asset_dynamics_collection) = storage::load();
+
+  if (~ if_active) {
+    ;; TODO: process re-enabling
+
+    ;; if it's any other message
+    throw(error::disabled);
+    ;; ??? WAIT
+    ;; What if someone supplies us TONs/Jettons in a disabled state?
+  }
+
+  ~dump(10000);
+  ~dump(in_msg_body.slice_bits());
+
+  if (in_msg_body.slice_empty?()) { ;; TON incoming (without comment)
+    ~dump(1);
+    asset_dynamics_collection = process_incoming_ton(
+      user_contract_code,
+      asset_config_collection, asset_dynamics_collection,
+      sender_address, msg_value
+    );
+    ~dump(2);
+    storage::save(
+      meta, user_contract_code,
+      asset_config_collection, 
+      if_active, admin, wallet_to_master,
+      asset_dynamics_collection
+    );
+
+    return ();
+  }
+
+  int op = in_msg_body~load_op_code();
+  if (op == 0) { ;; TON incoming (with comment)
+    asset_dynamics_collection = process_incoming_ton(
+      user_contract_code,
+      asset_config_collection, asset_dynamics_collection,
+      sender_address, msg_value
+    );
+    storage::save(
+      meta, user_contract_code,
+      asset_config_collection, 
+      if_active, admin, wallet_to_master,
+      asset_dynamics_collection
+    );
+    
+    return ();
+  }
+
+  int query_id = in_msg_body~load_query_id();
+
+  ;; More common op codes are checked first to save a little gas
+  if (op == op::supply_success) {
+    (slice owner_address, int asset_id,
+     int repay_amount_principal, int supply_amount_principal)
+      = parse_supply_success_message(in_msg_body);
+
+    ;; Verify this is a message from lending-user smart contract
+    throw_unless(
+      error::supply_success_fake_sender,
+      slice_data_equal?(
+        sender_address,
+        calculate_user_address(user_contract_code, owner_address)
+      )
+    );
+
+
+    (int price, int s_rate, int b_rate,
+     int total_supply_principal, int total_borrow_principal,
+     int last_accural, int token_balance)
+      = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+
+    asset_dynamics_collection~asset_dynamics_collection:set_packed(
+      asset_id,
+      price, s_rate, b_rate,
+      total_supply_principal + supply_amount_principal,
+      total_borrow_principal - repay_amount_principal,
+      last_accural, token_balance
+    );
+
+    storage::save(
+      meta, user_contract_code,
+      asset_config_collection, 
+      if_active, admin, wallet_to_master,
+      asset_dynamics_collection
+    );
+
+    return ();
+  }
+
+  if (op == op::init_master) {
+    var (wc, admin_addr_hash) = parse_std_addr(admin);
+    ;; throw_unless(103, addr_hash == admin_addr_hash); ;; !!! todo admin checker
+    cell new_asset_config_collection = in_msg_body~load_ref();
+    cell new_asset_dynamics_collection = in_msg_body~load_ref();
+    storage::save(meta, user_contract_code, new_asset_config_collection, if_active, admin, wallet_to_master, new_asset_dynamics_collection);
+    return ();
+  }
+  
+  if (op == op::init_user) {
+    init_user(user_contract_code, sender_address); 
+    return ();
+  }
+  
+  if (op == op::update_price) {
+    slice asset_address = in_msg_body~load_msg_addr();
+    var (_, asset_address_hash) = parse_std_addr(asset_address);
+    var (asset_config, is_asset_existing?) = asset_config_collection.udict_get?(256, asset_address_hash);
+    throw_unless(100, is_asset_existing?);
+    slice oracle = asset_config~load_msg_addr();
+    var (_, oracle_addr_hash) = parse_std_addr(oracle);
+    throw_unless(103, addr_hash == oracle_addr_hash);
+    var (asset_dynamics, _) = asset_dynamics_collection.udict_get?(256, asset_address_hash);
+    int new_price = in_msg_body~load_price();
+    var (_, s_rate, b_rate, total_supply_principal, total_borrow_principal, last_accural, token_balance) = unpack_asset_dynamics(asset_dynamics);
+    cell updated_asset = pack_asset_dynamics(
+      new_price, s_rate, b_rate,
+      total_supply_principal, total_borrow_principal,
+      last_accural, token_balance 
+    );
+    asset_dynamics_collection~udict_set(256, asset_address_hash, updated_asset.begin_parse());
+    storage::save(meta, user_contract_code, asset_config_collection, if_active, admin, wallet_to_master, asset_dynamics_collection);
+    return ();
+  }
+  
+  if (op == op::update_config) {
+    ;;todo update not only asset config but config of entire market (isActive & meta too)
+    var (wc, admin_addr_hash) = parse_std_addr(admin);
+    throw_unless(103, addr_hash == admin_addr_hash);
+    cell new_asset_config_collection = in_msg_body~load_ref();
+    storage::save(meta, user_contract_code, new_asset_config_collection, if_active, admin, wallet_to_master, asset_dynamics_collection);
+    return ();
+  }
+  
+  if (op == op::withdraw_master) {
+    ~dump(5000);
+    (int asset_id, int amount) = parse_withdraw_master_message(in_msg_body);
+
+    ~dump(5001);
+    asset_dynamics_collection = process_withdraw_master(
+      user_contract_code,
+      asset_config_collection, asset_dynamics_collection,
+      sender_address, asset_id, amount, query_id
+    );
+
+    ~dump(5002);
+    ;; The only reason we save is to update s/b-rate of the corresponding asset
+    ;; this is just a request to withdraw, no confirmation yet,
+    ;; so no amounts change
+    storage::save(
+      meta, user_contract_code,
+      asset_config_collection, 
+      if_active, admin, wallet_to_master,
+      asset_dynamics_collection
+    );
+
+    ~dump(5003);
+
+    return ();
+  }
+
+  if (op == op::withdraw_collateralized) {
+    ~dump(6200);
+    (slice owner_address, int asset_id, int withdraw_amount_current,
+     int borrow_amount_principal, int reclaim_amount_principal)
+      = parse_withdraw_collateralized_message(in_msg_body);
+
+    ~dump(6210);
+    ;; Verify this is a message from lending-user smart contract
+    throw_unless(
+      error::withdraw_collateralized_fake_sender,
+      slice_data_equal?(
+        sender_address,
+        calculate_user_address(user_contract_code, owner_address)
+      )
+    );
+    
+    ~dump(6220);
+    (int price, int s_rate, int b_rate,
+     int total_supply_principal, int total_borrow_principal,
+     int last_accural, int token_balance)
+      = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+
+    ;; TODO: think about more sofisticated formula from Vlad
+    if (withdraw_amount_current > token_balance) {
+      ~dump(6230);
+      ;; User withdraw request is collateralized, but unfortunately ...
+      ;; we just DON'T have enough of the corresponding token to send it
+      ;; "No money, but hang on"
+
+      ;; We need to send op::withdraw_fail message to the user smart contract to:
+      ;; a) Let it unlock itself
+      ;; b) Make it revert it's corresponding principal balance
+      send_message(
+        sender_address, 0,
+        pack_withdraw_fail_message(
+          query_id, asset_id,
+          borrow_amount_principal + reclaim_amount_principal,
+           withdraw_amount_current
+        ),
+        64 ;; ??? this mode?
+      );
+      ~dump(6240);
+    } else {
+      ~dump(6250);
+      ;; User withdraw request is collateralized
+      ;; and we HAVE enough of asset to satisfy it
+      asset_dynamics_collection~asset_dynamics_collection:set_packed(
+        asset_id,
+        price, s_rate, b_rate,
+        total_supply_principal - reclaim_amount_principal,
+        total_borrow_principal + borrow_amount_principal,
+        last_accural, token_balance - withdraw_amount_current
+      );
+
+      ~dump(6260);
+      send_asset(owner_address, query_id, asset_id, withdraw_amount_current);
+
+      ~dump(6270);
+      ;; We also need to send op::withdraw_success message to the user smart contract
+      ;; to let it unlock itself
+      send_message(
+        sender_address,
+        20000000, ;; TODO: think about attached TON amount
+        pack_withdraw_success_message(query_id),
+        1 ;; ??? this mode?
+      );
+
+      ~dump(6280);
+      storage::save(
+        meta, user_contract_code,
+        asset_config_collection, 
+        if_active, admin, wallet_to_master,
+        asset_dynamics_collection
+      );      
+
+      ~dump(6290);
+    }
+    ;; We only accept op::withdraw_collateralized from lending-user smart contracts,
+    ;; which means the corresponding lending-user smart contract
+    ;; had already been initialized by the point we received this message,
+    ;; which means it's fine not to include deploy info (state-init) in the message
+    ;; and just use send_message (instead of send_message_to_lending_wallet)
+    ;; to have a lighter message
+
+    return ();
+  }
+  
+  if (op == jetton_op::transfer_notification) {
+    ;; int query_id = in_msg_body~load_query_id(); (already loaded before)
+    int jetton_amount = in_msg_body~load_coins(); 
+    slice from_address = in_msg_body~load_msg_addr();
+    
+    ;; sender_address is the address of our jetton wallet
+    ;; (which received money and notified us)
+    ;; we need to find which jetton_type this wallet corresponds to
+    
+    int f = asset_dynamics_collection.asset_dynamics_collection:has?(addr_hash);
+    throw_unless(error::received_unsupported_jetton, f);
+    
+    ;; Either this jetton type is not supported (whitelisted)
+    ;; (??? Should we refund them? Is it even technically possible?)
+    ;; or someone just tried to hack-send us a transfer_notification from a random address
+
+    asset_dynamics_collection = process_incoming_asset(
+      user_contract_code,
+      asset_config_collection, asset_dynamics_collection,
+      addr_hash, ;; jetton_master_address, <- I am not sure we want this transformation anymore
+      from_address, jetton_amount
+    );
+
+     storage::save(
+       meta, user_contract_code,
+       asset_config_collection, 
+       if_active, admin, wallet_to_master,
+       asset_dynamics_collection
+     );
+
+    return ();
+  }
+
+  if (op == jetton_op::excesses) {
+    ;; Just accept TON excesses after sending jettons
+    return ();
+  }
+
+  ;; ??? Where does liquidate go?
+  ;; if (op_jetton == op::liquidate) {
+  ;;   ;; todo/anyone/to user/jetton
+  ;; }
+
+  throw(0xffff); 
+}

@@ -1,0 +1,186 @@
+#pragma version >=0.2.0;
+#include "imports/stdlib.fc";
+#include "imports/math.fc";
+#include "imports/op-codes.fc";
+#include "imports/errors.fc";
+#include "imports/constants.fc";
+#include "src/ton.fc";
+#include "src/storage.fc";
+#include "src/user-storage.fc";
+#include "src/asset-config-packer.fc";
+#include "src/asset-dynamics-packer.fc";
+#include "src/user-principals-packer.fc";
+#include "src/utils.fc";
+#include "src/user-utils.fc";
+#include "src/supply-message.fc";
+#include "src/user-get-methods.fc";
+#include "src/withdraw-message.fc";
+
+int get_principal(cell principals, int asset_id) {
+  (slice cs, int f) = principals.udict_get?(256, asset_id);
+  if (f) {
+    return cs.preload_principal();
+  } else {
+    return 0;
+    ;; Default to zero,
+    ;; so it doesn't have to store all possible assets from the start
+    ;; and the supported assets can be extended by changing master's config
+  }
+}
+
+(cell, ()) ~set_principal(cell principals, int asset_id, int amount) {
+  return (
+    principals.udict_set_builder(256, asset_id,
+      begin_cell().store_principal(amount)),
+    ()
+  );
+}
+
+
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  if (in_msg_body.slice_empty?()) { ;; ignore empty messages
+    return ();
+  }
+
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  slice sender_address = cs~load_msg_addr();
+  var (wc, addr_hash) = parse_std_addr(sender_address);
+
+  if (flags & 1) {
+    ;; TODO: Finish logic of on bounce
+    ;; on_bounce(in_msg_body, msg_value);
+    ;; in theory "throw(0xffff)" will be enougth
+		throw(0xffff); 
+  }
+
+  (slice master_address, slice owner_address, cell user_principals, int locked) = storage::load();
+
+  ;; todo make deployment work correctly with this checker
+  ;;throw_unless(error::message_not_from_master,
+  ;;  slice_data_equal?(sender_address, master_address)
+  ;;); ;; This line makes the contract unhackable (hopefully)
+	
+  int op = in_msg_body~load_op_code();
+  int query_id = in_msg_body~load_query_id();
+
+  if (op == op::withdraw_success) {
+    storage::save(master_address, owner_address, user_principals, false); ;; Unlock
+    return ();
+  }
+  if (op == op::withdraw_fail) {
+    (int asset_id, int principal_amount) = parse_withdraw_fail_message(in_msg_body);
+
+    int optimistic_principal = user_principals.get_principal(asset_id);
+    int reverted_principal = optimistic_principal + principal_amount; ;; withdraw failed - revert
+    user_principals~set_principal(asset_id, reverted_principal);
+    
+    ;; Update user_principals and Unlock
+    storage::save(master_address, owner_address, user_principals, false); 
+    return ();
+  }
+
+
+  ;; --------------- Locked area ---------------
+  throw_if(error::user_is_locked, locked);
+  ;; No other operations are permitted in case user contract is locked
+
+
+  if (op == op::supply) {
+    (int asset_master_hash, int supply_amount_current, int s_rate, int b_rate) = parse_supply_message(in_msg_body);
+    
+    int old_principal = user_principals.get_principal(asset_master_hash);
+    int present = present_value(s_rate, b_rate, old_principal);
+
+    present += supply_amount_current;
+
+    int new_principal = principal_value(s_rate, b_rate, present);
+    ;; ~dump(540);
+    ;; ~dump(new_principal);
+    user_principals~set_principal(asset_master_hash, new_principal);
+
+    (int repay_amount_principal,
+     int supply_amount_principal) = around_zero_split(old_principal, new_principal);
+
+    send_message(
+      master_address, 0,
+      pack_supply_success_message(
+        query_id,
+        owner_address, asset_master_hash,
+        repay_amount_principal, supply_amount_principal
+      ),
+      64 ;; ??? this mode?
+    );
+
+    storage::save(master_address, owner_address, user_principals, locked);
+
+    return ();
+  }
+
+  if (op == op::withdraw_user) {
+    (int asset_id, int withdraw_amount_current,
+     int s_rate, int b_rate,
+     cell asset_config_collection, cell asset_dynamics_collection)
+     = parse_withdraw_message(in_msg_body);
+
+    int old_principal = user_principals.get_principal(asset_id);
+    int present = present_value(s_rate, b_rate, old_principal);
+
+    ~dump(613);
+    ~dump(present);
+    ~dump(withdraw_amount_current);
+    present -= withdraw_amount_current;
+    ~dump(present);
+
+    int new_principal = principal_value(s_rate, b_rate, present);
+    ~dump(614);
+    ~dump(old_principal);
+    ~dump(new_principal);
+    user_principals~set_principal(asset_id, new_principal);
+
+    if (is_borrow_collateralized(
+      asset_config_collection, asset_dynamics_collection,
+      user_principals
+    )) {
+      (int borrow_amount_principal, int reclaim_amount_principal)
+        = around_zero_split(new_principal, old_principal);
+
+      send_message(
+        master_address, 0,
+        pack_withdraw_collateralized_message(
+          query_id,
+          owner_address, asset_id,
+          withdraw_amount_current,
+          borrow_amount_principal, reclaim_amount_principal
+        ),
+        64 ;; ??? this mode?
+      );
+
+      ;; Update user_principals and Lock contract
+      storage::save(master_address, owner_address, user_principals, true);
+
+      return ();
+    } else {
+      ;; Otherwise (borrow not collateralized) can just ignore request
+      return ();
+      ;; Or should we "throw" instead??
+    }
+  }
+
+  if (op == op::init_user) {
+    var (_, sender_address_hash) = parse_std_addr(sender_address);
+    var (_, master_hash) = parse_std_addr(master_address);
+    ;; throw_unless(66, sender_address_hash == master_hash); ;; todo make deployment work with this checker
+    cell new_user_principals = in_msg_body~load_ref();
+    storage::save(master_address, owner_address, new_user_principals, locked);
+    return();
+  }
+   
+  if (op == op::liquidate) {
+    ;; todo/from master 
+  }
+  
+  throw(0xffff); 
+}
+

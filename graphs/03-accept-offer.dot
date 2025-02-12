@@ -1,0 +1,23 @@
+digraph {
+    label="
+        Accept an offer.\l\
+        "
+    node [ colorscheme=pastel19 style=filled ]
+
+    /* Entities */
+    borower, collateralVault [ color=1 ]
+    loanOffer [ color=2 ]
+    TOKEN [ color=3 ]
+    router [ color=4 ]
+
+    /* Relationships */
+    borower -> loanOffer [ label="1\l op::accept\l 0.10 TON\l" ]
+    loanOffer -> TOKEN [ label="2\l op::transfer\l 0.10 TON\l" ]
+    TOKEN -> borower [ label="3\l op::transfer_notification\l 0.10 TON\l" ]
+    loanOffer -> router [ label="2\l op::transfer_notification\l 0.09 TON\l" ]
+    router -> collateralVault [ label="3\l op::transfer\l 0.09 TON\l" ]
+    collateralVault -> NFT [ label="4\l op::ownership_assigned\l 0.09 TON\l" ]
+    
+    /* Ranks */
+    { rank=min borower }
+}

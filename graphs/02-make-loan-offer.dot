@@ -1,0 +1,16 @@
+digraph {
+    label="
+        Make a loan offer.\l\
+        "
+    node [ colorscheme=pastel19 style=filled ]
+
+    /* Entities */
+    lender, loanOffer [ color=1 ]
+    TOKEN [ color=2 ]
+    /* Relationships */
+    lender -> TOKEN [ label="1\l op::transfer\l 0.10 TON\l" ]
+    TOKEN -> loanOffer [ label="2\l op::transfer_notification\l 0.09 TON\l" ]
+
+    /* Ranks */
+    { rank=min lender }
+}

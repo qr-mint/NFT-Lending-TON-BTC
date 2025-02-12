@@ -1,0 +1,24 @@
+node_modules
+temp
+dist
+.DS_Store
+
+# VS Code
+.vscode/*
+.history/
+*.vsix
+
+# IDEA files
+.idea
+
+# VIM
+Session.vim
+
+# Connection 
+/temp
+
+#local env
+*.env
+mnemonic.txt
+wallets0.csv
+*.pem
