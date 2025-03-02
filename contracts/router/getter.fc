@@ -1,0 +1,25 @@
+;; onchain get methods
+
+(int) handle_getter_messages(int op, int query_id, slice sender_address, slice in_msg_body) impure inline {
+    raw_reserve(0, 4);
+
+    if(op == getter_collateral_address){ 
+        (slice nft, slice token) = (in_msg_body~load_msg_addr(), in_msg_body~load_msg_addr());
+
+        throw_if(WRONG_ADDRESS, equal_slices(nft, token)); 
+        force_chain(WORKCHAIN, nft, WRONG_WORKCHAIN);
+        force_chain(WORKCHAIN, token, WRONG_WORKCHAIN);
+
+        (_, slice collateral_address) = get_collateral_state_init_and_address(nft, token);
+        
+        cell payload = begin_cell()
+            .store_uint(getter_collateral_address, 32)
+            .store_uint(query_id, 64)
+            .store_slice(collateral_address)
+        .end_cell();
+        send_payload(sender_address, payload);
+        return (true);
+    }
+
+    return (false); ;; wrong op
+}

@@ -1,0 +1,174 @@
+#pragma version >=0.2.0;
+
+#include "common/stdlib.fc";
+#include "common/stdlib-ext.fc";
+#include "common/gas.fc";
+#include "common/jetton-utils.fc";
+#include "common/messages.fc";
+#include "common/utils.fc";
+
+#include "router/get.fc"; 
+#include "router/admin-calls.fc"; 
+#include "router/getter.fc";  
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) { ;; ignore empty messages
+        return ();
+    }
+
+    var cs = in_msg_full.begin_parse();
+    var flags = cs~load_uint(4);
+    
+    load_storage();
+
+    if (flags & 1) {
+        return ();
+    }
+    
+    slice sender_address = cs~load_msg_addr();
+    cs~load_msg_addr(); ;; skip dst
+    cs~load_coins(); ;; skip value
+    cs~skip_bits(1); ;; skip extracurrency collection
+    cs~load_coins(); ;; skip ihr_fee
+    int fwd_fee = cs~load_coins();
+
+    force_chain(WORKCHAIN, sender_address, WRONG_WORKCHAIN);
+
+    (int op, int query_id) = (in_msg_body~load_uint(32), in_msg_body~load_uint(64));
+
+    ;; send tokens to repay, called from collateral (on repay)
+    if (op == pay_to) { 
+        int gas_required = get_gas_fee(20000, WORKCHAIN);
+        throw_unless(INSUFFICIENT_GAS, msg_value > gas_required);
+        (slice owner, int exit_code, cell cs_d) = (in_msg_body~load_msg_addr(), in_msg_body~load_uint(32), in_msg_body~load_ref()); 
+        
+        ;; parse ref cell
+        slice psd = cs_d.begin_parse();
+        (int amount0_out, slice token0_address, int amount1_out, slice token1_address) = (psd~load_coins(), psd~load_msg_addr(), psd~load_coins(), psd~load_msg_addr());
+
+        (_, slice pool_address) = get_pool_state_init_and_address(token0_address, token1_address);
+        throw_unless(INVALID_CALLER, equal_slices(pool_address, sender_address)); ;; check if its a valid pool
+        
+        int ton_amount = 0;
+        int mode = CARRY_REMAINING_GAS;
+
+        ;; Either one or both amounts must be non-zero
+        if ((amount0_out > 0) & (amount1_out > 0)) {
+            ;; Divide remaining ton_amount between two transactions
+            ton_amount = (msg_value - gas_required) / 2;
+            mode = NORMAL;
+        }
+
+        if (amount0_out > 0) {
+            var body0 = create_simple_transfer_body(query_id, 0, amount0_out, owner);
+            body0 = body0.store_uint(exit_code, 32); ;; append exit code
+            send_simple_message(ton_amount, token0_address, body0.end_cell(), mode | IGNORE_ERRORS);
+        }
+
+        if (amount1_out > 0) {
+            var body1 = create_simple_transfer_body(query_id, 0, amount1_out, owner);
+            body1 = body1.store_uint(exit_code, 32); ;; append exit code
+            send_simple_message(ton_amount, token1_address, body1.end_cell(), mode | IGNORE_ERRORS);
+        }
+
+        return ();
+    }
+
+    ;; send nft to
+    if (op == liquidation) {
+
+    }
+
+    ;; transfer token to create offer
+    if (op == transfer_notification) {
+        (int jetton_amount, slice from_user) = (in_msg_body~load_coins(), in_msg_body~load_msg_addr());
+        cell ref_cs = in_msg_body~load_ref(); 
+        slice ref_ds = ref_cs.begin_parse();
+        
+        throw_unless(INVALID_AMOUNT, jetton_amount > 0);
+        
+        (int transferred_op, slice token_wallet) = (ref_ds~load_uint(32), ref_ds~load_msg_addr());
+        force_chain(WORKCHAIN, token_wallet, WRONG_WORKCHAIN);
+
+        ;; check if the call is valid
+        if ((fwd_fee * 6 >  msg_value) | equal_slices(sender_address, token_wallet) | storage::is_locked) {
+            ;; refund jettons
+            var body = create_simple_transfer_body(query_id, 0, jetton_amount, from_user);
+            if (storage::is_locked) {
+                body = body.store_uint(transfer_bounce_locked, 32);
+            } else {
+                body = body.store_uint(transfer_bounce_invalid_request, 32);
+            }
+            send_simple_message(0, sender_address, body.end_cell(), CARRY_REMAINING_GAS);
+        } else {
+            if (transferred_op == create_offer) {
+                ;; receive token notification 
+                ;; mesages of initial loan offer of nft collateral address includes:
+                ;; - nft collateral address
+                ;; - base collateral amount: 1 TON
+                ;; - owner of offer 
+                (slice nft_collateral_address, int base_loan_amount, slice owner) = (in_msg_body~load_msg_addr(), in_msg_body~load_coins(), in_msg_body~load_msg_addr());
+                (cell state_init, slice offer_address) = get_offer_state_init_and_address(nft_collateral_address, token_wallet);
+                ;; check gas fee enough to process the message
+                int gas_required = get_gas_fee(20000, WORKCHAIN);
+                throw_unless(INSUFFICIENT_GAS, msg_value > gas_required);
+
+                ;; init a new offer contract with state_init the base_loan_amount of nft collateral
+                builder body = begin_cell()
+                    .store_uint(create_offer, 32)
+                    .store_uint(query_id, 64)
+                    .store_slice(nft_collateral_address)
+                    .store_coins(base_loan_amount)
+                    .store_slice(owner);
+
+                send_message_with_stateinit(0, offer_address, state_init, body.end_cell(), CARRY_REMAINING_GAS);
+            }
+
+        }
+        return ();
+    }
+
+    ;; transfer nft to create collateral
+    if (op == op::ownership_assigned()) {
+        ;; receive nft notification => owner of nft has been changed
+        ;; mesages of initial collateral of this nft includes:
+        ;; - nft address
+        ;; - token address
+        ;; - owner address
+        ;; - collateral address is this address
+        ;; - base collateral amount: 1 TON
+        (slice nft, int token_id, slice owner, slice collateral, int base_loan_amount) = (in_msg_body~load_msg_addr(), in_msg_body~load_coins(), in_msg_body~load_msg_addr(), in_msg_body~load_msg_addr(), in_msg_body~load_coins());
+        force_chain(WORKCHAIN, nft, WRONG_WORKCHAIN);
+        force_chain(WORKCHAIN, owner, WRONG_WORKCHAIN);
+
+        ;; check gas fee enough to process the message
+        int gas_required = get_gas_fee(20000, WORKCHAIN);
+        throw_unless(INSUFFICIENT_GAS, msg_value > gas_required);
+
+        ;; init a new collateral contract with state_init the base_loan_amount of nft collateral
+        (cell state_init, slice collateral_address) = get_collateral_state_init_and_address(nft, owner);
+        builder body = begin_cell()
+            .store_uint(init_collateral, 32)
+            .store_uint(query_id, 64)
+            .store_slice(nft)
+            .store_uint(token_id, 32)
+            .store_slice(owner)
+            .store_slice(collateral)
+            .store_coins(base_loan_amount);
+        
+        send_message_with_stateinit(0, collateral_address, state_init, body.end_cell(), CARRY_REMAINING_GAS);
+    }
+
+    ;; handle governance message from admin to change collateral parameters
+    if (equal_slices(sender_address, storage::admin_address)) {
+        handle_admin_messages(op, query_id, my_balance, msg_value, in_msg_body);
+        return ();
+    }
+
+    ;; make sure that the message has been processed
+    if (handle_getter_messages(op, query_id, sender_address, in_msg_body)) {
+        return (); 
+    }
+
+    throw(WRONG_OP);
+}

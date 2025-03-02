@@ -1,0 +1,23 @@
+;; get methods
+
+
+(slice) get_collateral_address(slice nft, slice token) method_id {
+    load_storage();
+    throw_if(WRONG_ADDRESS, equal_slices(nft, token)); 
+    force_chain(WORKCHAIN, nft, WRONG_WORKCHAIN);
+    force_chain(WORKCHAIN, token, WRONG_WORKCHAIN);
+    (_, slice collateral_address) = get_pool_state_init_and_address(nft, token);
+    return collateral_address;
+}
+
+(int, slice, cell, cell, cell, cell) get_router_data() method_id {
+    load_storage();
+    return (
+        storage::is_locked == 1,
+        storage::admin_address,
+        storage::temp_upgrade,
+        storage::collateral_code,
+        storage::wrapper_nft_code,
+        storage::lp_account_code ;; maybe reduce
+    );
+}

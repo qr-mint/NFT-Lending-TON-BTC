@@ -1,0 +1,42 @@
+
+cell pack_jetton_wallet_data(int balance, slice owner_address, slice jetton_master_address, cell jetton_wallet_code) inline {
+   return  begin_cell()
+            .store_coins(balance)
+            .store_slice(owner_address)
+            .store_slice(jetton_master_address)
+            .store_ref(jetton_wallet_code)
+           .end_cell();
+}
+
+cell calculate_jetton_wallet_state_init(slice owner_address, slice jetton_master_address, cell jetton_wallet_code) inline {
+  return begin_cell()
+          .store_uint(0, 2)
+          .store_dict(jetton_wallet_code)
+          .store_dict(pack_jetton_wallet_data(0, owner_address, jetton_master_address, jetton_wallet_code))
+          .store_uint(0, 1)
+          ;; Another way to write the same code:
+          ;; NOTE: store flag first, then store ref
+          ;; .store_uint(0, 1) ;; split_depth:(Maybe (## 5))
+          ;; .store_uint(0, 1) ;; special:(Maybe TickTock)
+          ;; .store_uint(1, 1) ;; (Maybe ^Cell)
+          ;; .store_uint(1, 1) ;; (Maybe ^Cell)
+          ;; .store_uint(0, 1) ;; (HashmapE 256 SimpleLib)
+          ;; .store_ref(init_code)
+          ;; .store_ref(init_data)
+         .end_cell();
+}
+
+slice calculate_jetton_wallet_address(cell state_init) inline {
+  return begin_cell().store_uint(4, 3) ;; addr_std$10 and anycast:(Maybe Anycast)
+                      ;;.store_uint(2, 2) ;; addr_std$10
+                      ;;.store_uint(0, 1) ;; anycast:(Maybe Anycast)
+                     .store_int(workchain(), 8)
+                     .store_uint(cell_hash(state_init), 256)
+                     .end_cell()
+                     .begin_parse();
+}
+
+slice calculate_user_jetton_wallet_address(slice owner_address, slice jetton_master_address, cell jetton_wallet_code) inline {
+  return calculate_jetton_wallet_address(calculate_jetton_wallet_state_init(owner_address, jetton_master_address, jetton_wallet_code));
+}
+
